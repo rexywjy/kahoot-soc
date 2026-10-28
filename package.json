@@ -1,0 +1,14 @@
+{
+  "name": "seekers-of-christ-quiz",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A colorful, real-time multiplayer quiz app",
+  "scripts": {
+    "dev": "node --watch server.js",
+    "start": "node server.js",
+    "test": "node --test",
+    "check": "node --check server.js && node --check lib/game.js && node --check lib/identity.js && node --check public/app.js && node --check public/theme.js && node --check public/celebration.js && node --check public/import.js"
+  },
+  "engines": { "node": ">=22" }
+}

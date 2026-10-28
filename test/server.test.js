@@ -1,0 +1,94 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { createApp } from '../server.js';
+
+test('HTTP integration: admin auth, durable quizzes, multiplayer updates, scoring and access isolation', async t => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'soc-quiz-test-'));
+  let app = await createApp({ dataDir, password: 'integration-test-password' });
+  await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
+  let base = `http://127.0.0.1:${app.server.address().port}`;
+  t.after(async () => { await app.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const request = async (route, { method = 'GET', data, cookie, token, origin } = {}) => {
+    const res = await fetch(base + route, { method, headers: { ...(data ? { 'Content-Type': 'application/json' } : {}), ...(cookie ? { Cookie: cookie } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(origin ? { Origin: origin } : {}) }, body: data ? JSON.stringify(data) : undefined });
+    return { status: res.status, data: await res.json(), headers: res.headers };
+  };
+  assert.equal((await fetch(base)).status, 200);
+  assert.equal((await request('/api/quizzes')).status, 401);
+  assert.equal((await request('/api/login', { method: 'POST', data: { password: 'bad' } })).status, 401);
+  const login = await request('/api/login', { method: 'POST', data: { password: 'integration-test-password' } });
+  const cookie = login.headers.get('set-cookie').split(';')[0]; assert.match(login.headers.get('set-cookie'), /HttpOnly/);
+  assert.equal((await request('/api/auth', { cookie })).data.admin, true);
+  assert.equal((await request('/api/rooms', { method: 'POST', cookie, origin: 'https://evil.example', data: {} })).status, 403);
+  const quiz = { title: 'Integration quiz', speedBonus: { enabled: false, maxPercent: 75 }, maxPlayers: 2, defaults: { duration: 30, points: 1000, negative: true, penalty: 250 }, questions: [
+    { text: 'Pick both', type: 'multiple', options: ['Yes', 'Also yes', 'No'], correct: [0, 1], points: 500, duration: 10, negative: true },
+    { text: 'One more', type: 'single', options: ['Yes', 'No'], correct: [0], points: 100, duration: 5, negative: false }
+  ] };
+  const saved = await request('/api/quizzes', { method: 'POST', cookie, data: quiz }); assert.equal(saved.status, 201);
+  const hosted = await request('/api/rooms', { method: 'POST', cookie, data: { quizId: saved.data.id } }); const pin = hosted.data.pin; assert.match(pin, /^[A-Z]{6}$/);
+  const updated = await request(`/api/quizzes/${saved.data.id}`, { method: 'PUT', cookie, data: { ...quiz, speedBonus: { enabled: true, maxPercent: 75 } } });
+  assert.equal(updated.status, 200); assert.equal(updated.data.speedBonus.enabled, true);
+  const player = name => request(`/api/rooms/${pin}/join`, { method: 'POST', data: { nickname: name } });
+  const a = (await player('Nova')).data, b = (await player('Comet')).data;
+  assert.equal((await player('NOVA')).status, 400);
+  assert.equal((await player('Extra')).status, 400);
+  assert.equal((await request(`/api/rooms/${pin}/settings`, { method: 'POST', token: a.token, data: { maxPlayers: 3 } })).status, 401);
+  assert.equal((await request(`/api/rooms/${pin}/settings`, { method: 'POST', cookie, data: { maxPlayers: 1 } })).status, 400);
+  assert.equal((await request(`/api/rooms/${pin}/settings`, { method: 'POST', cookie, data: { maxPlayers: 3 } })).status, 200);
+  assert.equal((await request(`/api/rooms/${pin}/settings`, { method: 'POST', cookie, data: { shuffleQuestions: 'yes' } })).status, 400);
+  assert.equal((await request(`/api/rooms/${pin}/settings`, { method: 'POST', cookie, data: { shuffleQuestions: true } })).status, 200);
+  assert.equal((await request(`/api/rooms/${pin}/settings`, { method: 'POST', cookie, data: { shuffleQuestions: false } })).status, 200);
+  const extra = (await player('')).data;
+  const extraState = (await request(`/api/rooms/${pin}/state`, { token: extra.token })).data;
+  assert.ok(extraState.me.nickname); assert.equal(extraState.maxPlayers, 3);
+  assert.equal(new Set(extraState.rankings.map(p => p.appearance.icon)).size, 3);
+  assert.equal(new Set(extraState.rankings.map(p => p.appearance.hue)).size, 3);
+  assert.equal((await request(`/api/rooms/${pin}/remove`, { method: 'POST', token: a.token, data: { playerId: extraState.me.id } })).status, 401);
+  const removedController = new AbortController();
+  const removedEvents = await fetch(`${base}/api/rooms/${pin}/events?token=${extra.token}`, { signal: removedController.signal });
+  const removedReader = removedEvents.body.getReader(); await removedReader.read();
+  assert.equal((await request(`/api/rooms/${pin}/remove`, { method: 'POST', cookie, data: { playerId: extraState.me.id } })).status, 200);
+  assert.match(new TextDecoder().decode((await removedReader.read()).value), /event: removed/);
+  assert.equal((await removedReader.read()).done, true); removedController.abort();
+  assert.equal((await request(`/api/rooms/${pin}/state`, { token: extra.token })).status, 403);
+  assert.equal((await request(`/api/rooms/${pin}/answer`, { method: 'POST', token: extra.token, data: { choices: [0], index: 0 } })).status, 403);
+  assert.equal((await fetch(`${base}/api/rooms/${pin}/events?token=${extra.token}`)).status, 403);
+  assert.equal((await request(`/api/rooms/${pin}/state`)).status, 401);
+  assert.equal((await request(`/api/rooms/${pin}/next`, { method: 'POST', token: a.token, data: {} })).status, 401);
+  const controller = new AbortController();
+  const events = await fetch(`${base}/api/rooms/${pin}/events?token=${a.token}`, { signal: controller.signal });
+  assert.equal(events.headers.get('content-type'), 'text/event-stream'); const reader = events.body.getReader();
+  assert.match(new TextDecoder().decode((await reader.read()).value), /"phase":"lobby"/);
+  assert.equal((await request(`/api/rooms/${pin}/next`, { method: 'POST', cookie, data: {} })).status, 200);
+  assert.match(new TextDecoder().decode((await reader.read()).value), /"phase":"preview"/);
+  const preview = (await request(`/api/rooms/${pin}/state`, { token: a.token })).data; assert.deepEqual(preview.question.options, []);
+  assert.equal((await request(`/api/rooms/${pin}/answer`, { method: 'POST', token: a.token, data: { choices: [0], index: 0 } })).status, 400);
+  // The server opens answers on its own once the preview ends.
+  assert.match(new TextDecoder().decode((await reader.read()).value), /"phase":"question"/);
+  const before = await request(`/api/rooms/${pin}/state`, { token: a.token }); assert.equal(before.data.question.correct, undefined);
+  assert.deepEqual(before.data.speedBonus, { enabled: false, maxPercent: 75 });
+  assert.equal((await request(`/api/rooms/${pin}/answer`, { method: 'POST', token: a.token, data: { choices: [1, 0], index: 0 } })).status, 200);
+  assert.equal((await request(`/api/rooms/${pin}/answer`, { method: 'POST', token: a.token, data: { choices: [2], index: 0 } })).status, 400);
+  await request(`/api/rooms/${pin}/answer`, { method: 'POST', token: b.token, data: { choices: [2], index: 0 } });
+  const after = (await request(`/api/rooms/${pin}/state`, { token: b.token })).data;
+  assert.equal(after.phase, 'leaderboard'); assert.deepEqual(after.rankings.map(p => p.score), [500, -500]); assert.deepEqual(after.question.correct, [0, 1]);
+  await request(`/api/rooms/${pin}/next`, { method: 'POST', cookie, data: {} });
+  // Exercise a real server-owned deadline (after the preview), including no submitted answers.
+  await new Promise(resolve => setTimeout(resolve, 1500 + 5100));
+  assert.equal((await request(`/api/rooms/${pin}/state`, { token: a.token })).data.phase, 'leaderboard');
+  await request(`/api/rooms/${pin}/next`, { method: 'POST', cookie, data: {} });
+  assert.equal((await request(`/api/rooms/${pin}/state`, { token: a.token })).data.phase, 'finished');
+  controller.abort(); await reader.cancel().catch(() => {});
+  await request('/api/logout', { method: 'POST', cookie, data: {} }); assert.equal((await request('/api/quizzes', { cookie })).status, 401);
+  await app.close();
+  app = await createApp({ dataDir, password: 'integration-test-password' });
+  await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve)); base = `http://127.0.0.1:${app.server.address().port}`;
+  const newLogin = await request('/api/login', { method: 'POST', data: { password: 'integration-test-password' } }), newCookie = newLogin.headers.get('set-cookie').split(';')[0];
+  const reloaded = (await request('/api/quizzes', { cookie: newCookie })).data.quizzes.find(q => q.id === saved.data.id);
+  assert.ok(reloaded); assert.equal(reloaded.maxPlayers, 2); assert.deepEqual(reloaded.defaults, { ...quiz.defaults, penaltyMatchesPoints: false });
+  assert.deepEqual(reloaded.speedBonus, { enabled: true, maxPercent: 75 });
+  assert.equal((await request(`/api/quizzes/${saved.data.id}`, { method: 'DELETE', cookie: newCookie, data: {} })).status, 200);
+  assert.ok(!(await request('/api/quizzes', { cookie: newCookie })).data.quizzes.some(q => q.id === saved.data.id));
+});
